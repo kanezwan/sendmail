@@ -12,6 +12,7 @@ import email
 from email.header import decode_header
 import os
 import re
+import shutil
 import sys
 import pypdfium2 as pdfium
 from PIL import Image
@@ -278,6 +279,14 @@ def process_mailbox(mail: imaplib.IMAP4_SSL, account_label: str) -> tuple[int, i
     return (processed_count, skipped_count)
 
 
+def clean_invoice_dir():
+    """清空 invoice/ 目录下所有文件和子目录"""
+    if BASE_DIR.exists():
+        shutil.rmtree(BASE_DIR)
+        print(f"🧹 已清空目录: {BASE_DIR}")
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def main():
     """主入口：遍历所有配置的邮箱"""
     accounts = parse_accounts()
@@ -285,6 +294,9 @@ def main():
         print("❌ 未配置邮箱账号，请在 .env 文件中设置 EMAIL_ACCOUNTS")
         print("   格式: 用户名:密码:IMAP服务器;用户名:密码:IMAP服务器")
         sys.exit(1)
+
+    # 启动前清空 invoice/ 目录
+    clean_invoice_dir()
 
     total_processed = 0
     total_skipped = 0
