@@ -33,6 +33,8 @@ sendinvoice/
 ### 1. 安装 Python 依赖
 
 ```bash
+python3 -m venv ~/.venv 
+source ~/.venv/bin/activate 
 pip install -r requirements.txt
 ```
 
