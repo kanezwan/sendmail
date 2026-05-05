@@ -8,6 +8,7 @@
 2. **多发票类型支持**：
    - **"票通"类型**：附件直接带 PDF
    - **"财云通"(bigfintax) 类型**：邮件正文仅提供下载链接，程序自动调用接口拉取 PDF
+   - **"朴朴超市"(pupumall) 类型**：邮件正文含 PDF 直链，下载后从 PDF 内容提取字段
 3. **PDF → JPG**：自动将发票 PDF 转换为高清 JPG 图片
 4. **智能跳过**：已下载的发票不会重复处理
 5. **自动清理**：发票邮件处理完成后自动移动到邮箱回收站（可恢复），非发票邮件保留不动
@@ -131,6 +132,20 @@ python main.py
   2. 调用 `https://gateway.bigfintax.com/xxApi/api/v2/electronInvoice/invoiceBatchDownload?id={inv_id}&downloadType=1` 直接下载 PDF
   3. 从响应头 `Content-Disposition` 的文件名解析发票号、销方、购方、开票日期
 - **输出**：`invoice/{购方姓名}-{销方地区}/{发票号码}.jpg`
+
+### 类型三："朴朴超市"（pupumall，邮件含 PDF 直链）
+
+- **发件人**：`朴朴超市 <message@pupumall.net>`
+- **邮件主题**：`朴朴超市-电子发票通知邮件`（完全固定）
+- **邮件正文**：HTML 中包含 3 个 `<a href='...'>` 链接（XML / OFD / PDF），PDF 链接形如 `https://finance-files.pupumall.com/INVOICE_REQUEST/{年}/{月}/{日}/{uuid}/{hash}.pdf`
+- **处理方式**：
+  1. 从正文正则提取 `.pdf` 链接
+  2. `requests.get` 直接下载（无需鉴权）
+  3. 用 `pypdfium2` 提取 PDF 第一页文本，正则解析：
+     - 发票号码（20 位数字）
+     - 销售方名称（`X市XXX有限公司`）→ 地区
+     - 购买方姓名（销方公司名同行前面的 2-4 字中文）
+- **输出**：`invoice/{购买方姓名}-{销方地区}/{发票号码}.jpg`
 
 ## 邮件清理策略
 

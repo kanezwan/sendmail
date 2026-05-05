@@ -360,6 +360,166 @@ def process_bigfintax_invoice(
     return True
 
 
+# ── 朴朴超市（pupumall）类型发票 ──────────────────────
+PUPU_PDF_URL_RE = re.compile(
+    r"""href=['"](https://finance-files\.pupumall\.com/[^'"]+\.pdf)['"]"""
+)
+
+
+def extract_pdf_text(pdf_path: Path) -> str:
+    """使用 pypdfium2 提取 PDF 第一页文本"""
+    pdf = pdfium.PdfDocument(str(pdf_path))
+    try:
+        page = pdf[0]
+        tp = page.get_textpage()
+        return tp.get_text_bounded()
+    finally:
+        pdf.close()
+
+
+def parse_pupu_pdf_text(text: str) -> dict:
+    """
+    从朴朴发票 PDF 提取的文本中解析字段。
+    返回 {"invoice_no", "buyer", "seller"}，未识别字段为 None。
+    """
+    result = {"invoice_no": None, "buyer": None, "seller": None}
+
+    # 发票号码：电子发票号码固定 20 位数字
+    m = re.search(r"\b(\d{20})\b", text)
+    if m:
+        result["invoice_no"] = m.group(1)
+
+    # 销方名称：优先匹配 "X市XXX有限公司"，兜底匹配任意 "XXX有限公司"
+    m = re.search(r"([\u4e00-\u9fa5]+市[\u4e00-\u9fa5]+?有限公司)", text)
+    if not m:
+        m = re.search(r"([\u4e00-\u9fa5]{2,}?有限公司)", text)
+    if m:
+        result["seller"] = m.group(1)
+
+    # 购买方姓名：销方公司名所在行的前面那段中文（2-4 字），格式 "{姓名} {销方}"
+    if result["seller"]:
+        m = re.search(
+            r"([\u4e00-\u9fa5]{2,4})\s+" + re.escape(result["seller"]),
+            text,
+        )
+        if m:
+            result["buyer"] = m.group(1)
+
+    return result
+
+
+def process_pupu_invoice(msg, sender: str, subject: str) -> bool:
+    """
+    处理朴朴超市类型发票邮件：
+    1. 识别类型（发件人 pupumall.net 或 主题含"朴朴超市-电子发票通知"）
+    2. 从 HTML 正文提取 PDF 链接
+    3. requests.get 下载 PDF
+    4. pypdfium2 提取文本，解析 发票号/销方/购方姓名
+    5. PDF → JPG，保存到 invoice/{姓名}-{地区}/{发票号}.jpg
+    """
+    is_pupu = (
+        "pupumall.net" in sender.lower()
+        or "朴朴超市" in sender
+        or "朴朴超市-电子发票" in subject
+    )
+    if not is_pupu:
+        return False
+
+    html = get_email_html_body(msg)
+    if not html:
+        return False
+
+    m = PUPU_PDF_URL_RE.search(html)
+    if not m:
+        print(f"── 邮件: {subject}")
+        print("   类型: 朴朴超市 | ❌ 正文未找到 PDF 链接")
+        return False
+
+    pdf_url = m.group(1)
+    print(f"── 邮件: {subject}")
+    print(f"   类型: 朴朴超市(pupumall) | url={pdf_url[:80]}...")
+
+    # 下载 PDF
+    try:
+        r = requests.get(
+            pdf_url,
+            headers={"User-Agent": "Mozilla/5.0 Chrome/124.0"},
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"  ❌ 下载请求失败: {e}")
+        return False
+
+    if r.status_code != 200 or not r.content.startswith(b"%PDF"):
+        print(f"  ❌ 下载失败: HTTP {r.status_code}, 首字节 {r.content[:8]!r}")
+        return False
+
+    pdf_bytes = r.content
+    print(f"  📥 已下载: {len(pdf_bytes)} bytes")
+
+    # 先写入临时 PDF（在临时目录，解析完再决定最终保存路径）
+    tmp_pdf = BASE_DIR / f".pupu_tmp_{os.getpid()}.pdf"
+    tmp_pdf.parent.mkdir(parents=True, exist_ok=True)
+    tmp_pdf.write_bytes(pdf_bytes)
+
+    try:
+        # 提取文本解析字段
+        try:
+            text = extract_pdf_text(tmp_pdf)
+        except Exception as e:
+            print(f"  ❌ PDF 文本提取失败: {e}")
+            return False
+
+        info = parse_pupu_pdf_text(text)
+        invoice_no = info["invoice_no"]
+        buyer = info["buyer"]
+        seller = info["seller"]
+
+        # 兜底
+        if not invoice_no:
+            # 用 URL 里的 hash 末 12 位兜底
+            url_hash = re.search(r"/([0-9a-f]{20,})\.pdf$", pdf_url)
+            invoice_no = url_hash.group(1)[-12:] if url_hash else "unknown"
+            print(f"  ⚠️  未解析到发票号，使用兜底: {invoice_no}")
+
+        if not buyer:
+            buyer = "未知"
+            print("  ⚠️  未解析到购买方姓名")
+
+        if seller:
+            region, _ = extract_region(seller)
+        else:
+            region = "未知地区"
+            print("  ⚠️  未解析到销方名称")
+
+        print(f"   姓名: {buyer} | 地区: {region} | 发票号: {invoice_no}")
+
+        # 保存路径
+        save_dir = BASE_DIR / f"{buyer}-{region}"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        jpg_path = save_dir / f"{invoice_no}.jpg"
+
+        if jpg_path.exists():
+            print(f"  ⏭️  已存在，跳过: {jpg_path.name}")
+            return True
+
+        # PDF → JPG
+        final_pdf = save_dir / f"{invoice_no}.pdf"
+        try:
+            shutil.move(str(tmp_pdf), str(final_pdf))
+            try:
+                pdf_to_jpg(final_pdf, jpg_path)
+            except Exception as e:
+                print(f"  ❌ PDF 转换失败: {e}")
+                return False
+        finally:
+            final_pdf.unlink(missing_ok=True)
+
+        return True
+    finally:
+        tmp_pdf.unlink(missing_ok=True)
+
+
 def connect_imap(server: str, user: str, password: str) -> imaplib.IMAP4_SSL | None:
     """连接并登录 IMAP 服务器，失败返回 None"""
     print(f"📧 正在连接邮箱 {user} ({server}) ...")
@@ -430,6 +590,11 @@ def process_mailbox(mail: imaplib.IMAP4_SSL, account_label: str) -> tuple[int, i
         if not parsed:
             # 尝试财云通（bigfintax）类型
             if process_bigfintax_invoice(msg, sender, subject):
+                processed_count += 1
+                delete_ids.append(msg_uid)
+                print()
+            # 尝试朴朴超市（pupumall）类型
+            elif process_pupu_invoice(msg, sender, subject):
                 processed_count += 1
                 delete_ids.append(msg_uid)
                 print()
