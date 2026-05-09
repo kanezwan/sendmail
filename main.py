@@ -362,9 +362,68 @@ def _adapter_nuonuo(final_url: str, session: requests.Session) -> tuple[bytes, d
     }
 
 
+def _adapter_bigfintax(final_url: str, session: requests.Session) -> tuple[bytes, dict] | None:
+    """
+    财云通（gateway.bigfintax.com）SPA 中转页：
+    1) 邮件链接形如 .../scanning-invoice/checkInvoice?id=<id>
+    2) 真实 PDF 下载：
+       https://gateway.bigfintax.com/sopinv/invoice/out/fusion/templateDownload/1/<id>saas
+       （type=1=PDF, type=2=OFD, type=3=XML；apply_serial_no = id + "saas"）
+    3) 详情接口（AES-CBC 加密响应，可选用于补全字段）：
+       GET /xxApi/api/v2/electronInvoice/getInvoiceInfo?id=<id>
+    """
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(final_url)
+    qs = parse_qs(parsed.query)
+    inv_id = qs.get("id", [""])[0]
+    if not inv_id:
+        return None
+
+    extra: dict = {}
+    apply_serial_no = inv_id + "saas"
+
+    # 先尝试详情 API 补全字段（AES 解密响应，失败也不影响 PDF 下载）
+    try:
+        from base64 import b64decode
+        from json import loads as json_loads
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
+
+        info_api = f"{parsed.scheme}://{parsed.netloc}/xxApi/api/v2/electronInvoice/getInvoiceInfo"
+        headers = dict(DEFAULT_HEADERS)
+        headers["Referer"] = final_url
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        rj = session.get(info_api, params={"id": inv_id}, headers=headers, timeout=30).json()
+        if rj.get("result") == "success" and rj.get("data") and rj.get("key"):
+            raw = b64decode(rj["data"])
+            iv, ct = raw[:16], raw[16:]
+            key = b64decode(rj["key"])
+            plain = unpad(AES.new(key, AES.MODE_CBC, iv).decrypt(ct), AES.block_size)
+            obj = json_loads(plain.decode("utf-8"))
+            extra = {
+                "name": obj.get("buyer"),
+                "invoice_no": obj.get("invoiceNumeric"),
+                "seller": obj.get("seller") or obj.get("orgName"),
+            }
+            # downloadUrl 形如 .../sopinv/invoicePreview.html?apply_serial_no=<id>saas
+            dl_url = obj.get("downloadUrl") or ""
+            m = re.search(r"apply_serial_no=([A-Za-z0-9]+)", dl_url)
+            if m:
+                apply_serial_no = m.group(1)
+    except Exception as e:
+        print(f"  ⚠️  财云通详情 API 失败（不影响 PDF 下载）: {e}")
+
+    pdf_url = f"{parsed.scheme}://{parsed.netloc}/sopinv/invoice/out/fusion/templateDownload/1/{apply_serial_no}"
+    pdf = _try_download_pdf(pdf_url, session, referer=final_url)
+    if not pdf:
+        return None
+    return pdf, extra
+
+
 # host 关键字 → 适配器
 LANDING_ADAPTERS = [
     ("nnfp.jss.com.cn", _adapter_nuonuo),
+    ("gateway.bigfintax.com", _adapter_bigfintax),
     # 后续新站点只在此处加一行
 ]
 
