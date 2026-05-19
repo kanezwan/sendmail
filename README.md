@@ -35,6 +35,7 @@
 | 来源 | 发件人示例 | 命中环节 |
 |---|---|---|
 | 票通 | 各税务平台 | 附件 `.pdf` |
+| 美团电票平台 | `it_fapiao@meituan.com` | 附件 `.pdf`（HTML 正文标准 label 字段） |
 | 朴朴超市 | `message@pupumall.net` | 正文 `.pdf` 直链 |
 | 财云通 | `ysb@szyh.com` | 中转页通用 API 探测（含 `download` 关键字） |
 | 诺诺网 | `invoice@info.nuonuo.com` | `nnfp.jss.com.cn` 适配器 |
