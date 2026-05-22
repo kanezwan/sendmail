@@ -224,13 +224,14 @@ def extract_pdf_text(pdf_path: Path) -> str:
 # ── 通用字段抽取 ──────────────────────────────────────
 def _search_label(text: str, labels: list[str]) -> str | None:
     """
-    依次按 label 在文本里查找 `{label}[：:]\\s*([^\\s<]+)`，找到即返回。
+    依次按 label 在文本里查找 `{label}[：:][水平空白]*([^\\s<>]+)`，找到即返回。
+    冒号后只允许水平空白（空格/制表），不跨行——避免吃掉换行后把下一字段名当成本字段值。
     text 应已统一全角冒号为半角。
     """
     if not text:
         return None
     for label in labels:
-        m = re.search(rf"{re.escape(label)}\s*[:：]\s*([^\s<>]+)", text)
+        m = re.search(rf"{re.escape(label)}\s*[:：][ \t]*([^\s<>]+)", text)
         if m:
             return m.group(1).strip().rstrip("，,；;。.")
     return None
@@ -645,6 +646,30 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                         m = re.search(r"([\u4e00-\u9fa5]{2,}?有限公司)", pdf_text_norm)
                     if m:
                         seller = m.group(1)
+                if not name:
+                    # 1) 标准 label（如"发票抬头"/"购买方名称"）
+                    name = _search_label(pdf_text_norm, NAME_LABELS)
+                # 2) 切"购买方"到"销售方/销方"之间的区块，找区块内"名称:"（盒马等版式）
+                if not name:
+                    m_blk = re.search(
+                        r"购\s*买\s*方[\s\S]*?(?=销\s*售\s*方|销\s*方|$)",
+                        pdf_text_norm,
+                    )
+                    if m_blk:
+                        m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", m_blk.group(0))
+                        if m_n:
+                            cand = m_n.group(1).strip().rstrip("，,；;。.")
+                            # 排除掉抽到"购买方信息"这种边角情况
+                            if cand and "信息" not in cand:
+                                name = cand
+                # 3) 全文第一个"名称:"作为最弱兜底（购方区块通常在销方之前）
+                if not name:
+                    m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", pdf_text_norm)
+                    if m_n:
+                        cand = m_n.group(1).strip().rstrip("，,；;。.")
+                        if cand and seller and cand != seller and "信息" not in cand:
+                            name = cand
+                # 4) 名字 + 销方相邻的旧启发式（保留兼容）
                 if not name and seller:
                     m = re.search(
                         r"([\u4e00-\u9fa5]{2,4})\s+" + re.escape(seller),
