@@ -2,7 +2,7 @@
 """
 发票邮件处理工具（通用版）
 
-入口：邮件主题包含"发票"即视为发票邮件，进入统一处理流程。
+入口：邮件主题包含"发票"或"电子报销凭证"即视为发票邮件，进入统一处理流程。
 
 通用流程：
 1. 解析邮件正文（HTML/纯文本）+ 主题，按内置 label 表抽取
@@ -267,12 +267,8 @@ def extract_invoice_fields(subject: str, html: str, text: str) -> dict:
     invoice_no = _search_label(combined, INVOICE_LABELS)
     seller = _search_label(combined, SELLER_LABELS) or _seller_from_subject(subject)
 
-    # 发票号兜底：主题里 "发票号码：xxx" 已被 _search_label 覆盖；
-    # 再兜底搜 12-20 位连续数字（避免误命中过短/过长的数字串）
-    if not invoice_no:
-        m = re.search(r"\b(\d{12,20})\b", combined)
-        if m:
-            invoice_no = m.group(1)
+    # 注意：这里不做"任意 12-20 位数字"兜底——邮件正文里的订单号、手机号等
+    # 容易被误匹配。真正的兜底放到 process_invoice_mail 里基于 PDF 文本完成。
 
     return {"name": name, "invoice_no": invoice_no, "seller": seller}
 
@@ -522,15 +518,19 @@ def collect_pdf_from_mail(msg, html: str) -> tuple[bytes, str | None, dict] | No
     2) 正文 <a href> 中的 *.pdf 直链
     3) 正文中所有 http(s) 链接 → 中转页探测
     """
-    # 1) 附件
+    # 1) 附件（识别策略：multipart 容器外的 part，只要是 application/pdf 或文件名 .pdf 就算附件，
+    #    不强求 Content-Disposition 含 attachment——携程等邮件该字段为空）
     for part in msg.walk():
-        disp = str(part.get("Content-Disposition", ""))
-        if "attachment" not in disp.lower():
+        if part.is_multipart():
             continue
+        ctype = (part.get_content_type() or "").lower()
         filename = part.get_filename()
         if filename:
             filename = decode_mime_words(filename)
-        if not filename or not filename.lower().endswith(".pdf"):
+        is_pdf = ctype == "application/pdf" or (
+            filename and filename.lower().endswith(".pdf")
+        )
+        if not is_pdf:
             continue
         data = part.get_payload(decode=True)
         if data and _looks_like_pdf(data):
@@ -752,8 +752,8 @@ def process_mailbox(mail: imaplib.IMAP4_SSL, account_label: str) -> tuple[int, i
         subject = decode_mime_words(msg.get("Subject", ""))
         sender = decode_mime_words(msg.get("From", ""))
 
-        # 唯一入口规则：主题含"发票"
-        if "发票" not in subject:
+        # 入口规则：主题含"发票"或"电子报销凭证"（兼容携程等场景）
+        if "发票" not in subject and "电子报销凭证" not in subject:
             skipped_count += 1
             continue
 
