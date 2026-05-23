@@ -251,6 +251,39 @@ def _seller_from_subject(subject: str) -> str | None:
     return None
 
 
+# 模板占位符：%fphm% / ${xfmc} / {{name}} / #fpdm# 之类未被运营平台渲染的字面量
+_PLACEHOLDER_RE = re.compile(
+    r"""^[\s]*           # 前导空白
+        (?:%[A-Za-z_][\w]*%        # %fphm%
+          |\$\{?[A-Za-z_][\w]*\}?   # $fphm 或 ${fphm}
+          |\{\{?[A-Za-z_][\w]*\}?\} # {fphm} 或 {{fphm}}
+          |\#[A-Za-z_][\w]*\#       # #fphm#
+        )[\s]*$""",
+    re.VERBOSE,
+)
+
+
+def _is_placeholder(value: str | None) -> bool:
+    """识别未被模板引擎渲染的占位符（如 %fphm% / ${xfmc} / {{name}}）。"""
+    if not value:
+        return False
+    return bool(_PLACEHOLDER_RE.match(value))
+
+
+def _is_valid_invoice_no(value: str | None) -> bool:
+    """合法发票号：12-20 位纯数字。"""
+    if not value:
+        return False
+    return bool(re.fullmatch(r"\d{12,20}", value))
+
+
+def _is_valid_chinese_field(value: str | None) -> bool:
+    """合法的 name/seller 应至少包含一个中文字符且不是模板占位符。"""
+    if not value or _is_placeholder(value):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fa5]", value))
+
+
 def extract_invoice_fields(subject: str, html: str, text: str) -> dict:
     """
     从主题 + HTML + 纯文本里抽取通用字段。
@@ -267,6 +300,15 @@ def extract_invoice_fields(subject: str, html: str, text: str) -> dict:
     name = _search_label(combined, NAME_LABELS)
     invoice_no = _search_label(combined, INVOICE_LABELS)
     seller = _search_label(combined, SELLER_LABELS) or _seller_from_subject(subject)
+
+    # 过滤未渲染的模板占位符（如 %fphm% / ${xfmc}）和明显不合法值
+    # 否则会让 PDF 兜底分支因 `if not xxx` 短路而跳过，最终落盘错误文件名
+    if not _is_valid_invoice_no(invoice_no):
+        invoice_no = None
+    if _is_placeholder(name) or (name and not re.search(r"[\u4e00-\u9fa5]", name) and not name.isalnum()):
+        name = None
+    if not _is_valid_chinese_field(seller):
+        seller = None
 
     # 注意：这里不做"任意 12-20 位数字"兜底——邮件正文里的订单号、手机号等
     # 容易被误匹配。真正的兜底放到 process_invoice_mail 里基于 PDF 文本完成。
@@ -610,18 +652,40 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
 
     # landing 适配器返回的字段优先级高于正文（因为来自结构化 API）
     if extra:
-        name = extra.get("name") or name
-        invoice_no = extra.get("invoice_no") or invoice_no
-        seller = extra.get("seller") or seller
+        ex_name = extra.get("name")
+        ex_inv = extra.get("invoice_no")
+        ex_sel = extra.get("seller")
+        if _is_placeholder(ex_name):
+            ex_name = None
+        if not _is_valid_invoice_no(ex_inv):
+            ex_inv = None
+        if _is_placeholder(ex_sel):
+            ex_sel = None
+        name = ex_name or name
+        invoice_no = ex_inv or invoice_no
+        seller = ex_sel or seller
 
-    # 下载文件名形如 "电子发票（普通发票）_{发票号}_{销方}_{购方}_{日期}.pdf"
+    # 下载文件名兜底，支持两类常见命名：
+    #   财云通等：电子发票（普通发票）_{发票号}_{销方}_{购方}_{日期}.pdf  (≥4 段)
+    #   鲜语等：  {发票号}_{购方姓名}.pdf                                 (2 段，首段为 12-20 位数字)
     if dl_filename:
         stem = Path(dl_filename).stem
         parts = stem.split("_")
         if len(parts) >= 4:
-            invoice_no = invoice_no or parts[-4]
-            seller = seller or parts[-3]
-            name = name or parts[-2]
+            cand_inv = parts[-4]
+            if _is_valid_invoice_no(cand_inv):
+                invoice_no = invoice_no or cand_inv
+            if not _is_placeholder(parts[-3]):
+                seller = seller or parts[-3]
+            if not _is_placeholder(parts[-2]):
+                name = name or parts[-2]
+        elif len(parts) == 2 and _is_valid_invoice_no(parts[0]):
+            invoice_no = invoice_no or parts[0]
+            cand_name = parts[1]
+            if cand_name and not _is_placeholder(cand_name):
+                name = name or cand_name
+        elif len(parts) == 1 and _is_valid_invoice_no(parts[0]):
+            invoice_no = invoice_no or parts[0]
 
     # 用 PDF 文本兜底
     if not invoice_no or not name or not seller:
