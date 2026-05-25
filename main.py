@@ -284,6 +284,18 @@ def _is_valid_chinese_field(value: str | None) -> bool:
     return bool(re.search(r"[\u4e00-\u9fa5]", value))
 
 
+_NAME_NOISE_RE = re.compile(
+    r"(代码|识别|纳税|号码|统一社会|信用|信息|名称|日期|项目|合计|备注|开票|金额|大写|小写|税额|税率|单位|数量|单价|发票|电子|普通|销售|购买|地址|电话|账号|开户)"
+)
+
+
+def _looks_like_label_noise(value: str | None) -> bool:
+    """候选姓名/抬头若包含发票模板的标签词，认为是噪声而非真实抬头。"""
+    if not value:
+        return True
+    return bool(_NAME_NOISE_RE.search(value))
+
+
 def extract_invoice_fields(subject: str, html: str, text: str) -> dict:
     """
     从主题 + HTML + 纯文本里抽取通用字段。
@@ -705,14 +717,17 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                     if m:
                         invoice_no = m.group(1)
                 if not seller:
-                    m = re.search(r"([\u4e00-\u9fa5]+市[\u4e00-\u9fa5]+?有限公司)", pdf_text_norm)
+                    # 优先匹配"XX市YY有限(责任)公司"
+                    m = re.search(r"([\u4e00-\u9fa5]+市[\u4e00-\u9fa5]+?有限(?:责任)?公司)", pdf_text_norm)
                     if not m:
-                        m = re.search(r"([\u4e00-\u9fa5]{2,}?有限公司)", pdf_text_norm)
+                        m = re.search(r"([\u4e00-\u9fa5]{2,}?有限(?:责任)?公司)", pdf_text_norm)
                     if m:
                         seller = m.group(1)
                 if not name:
                     # 1) 标准 label（如"发票抬头"/"购买方名称"）
-                    name = _search_label(pdf_text_norm, NAME_LABELS)
+                    cand = _search_label(pdf_text_norm, NAME_LABELS)
+                    if cand and not _looks_like_label_noise(cand):
+                        name = cand
                 # 2) 切"购买方"到"销售方/销方"之间的区块，找区块内"名称:"（盒马等版式）
                 if not name:
                     m_blk = re.search(
@@ -723,15 +738,14 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                         m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", m_blk.group(0))
                         if m_n:
                             cand = m_n.group(1).strip().rstrip("，,；;。.")
-                            # 排除掉抽到"购买方信息"这种边角情况
-                            if cand and "信息" not in cand:
+                            if cand and not _looks_like_label_noise(cand):
                                 name = cand
                 # 3) 全文第一个"名称:"作为最弱兜底（购方区块通常在销方之前）
                 if not name:
                     m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", pdf_text_norm)
                     if m_n:
                         cand = m_n.group(1).strip().rstrip("，,；;。.")
-                        if cand and seller and cand != seller and "信息" not in cand:
+                        if cand and seller and cand != seller and not _looks_like_label_noise(cand):
                             name = cand
                 # 4) 名字 + 销方相邻的旧启发式（保留兼容）
                 if not name and seller:
@@ -739,8 +753,17 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                         r"([\u4e00-\u9fa5]{2,4})\s+" + re.escape(seller),
                         pdf_text_norm,
                     )
-                    if m:
+                    if m and not _looks_like_label_noise(m.group(1)):
                         name = m.group(1)
+                # 5) 新版国家电子发票（购方/销方标签纵排成单字），值集中在文本末尾：
+                #    形如 "周琬 天津西瓜旅游有限责任公司" 的两 token 行
+                if not name:
+                    m = re.search(
+                        r"([\u4e00-\u9fa5]{2,6})\s+[\u4e00-\u9fa5]{2,}?有限(?:责任)?公司",
+                        pdf_text_norm,
+                    )
+                    if m and not _looks_like_label_noise(m.group(1)):
+                        name = m.group(1).strip()
         finally:
             tmp_pdf.unlink(missing_ok=True)
 
