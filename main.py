@@ -159,20 +159,52 @@ def html_to_text(html: str) -> str:
     return text
 
 
+# 常见直辖市/省份/省会简称白名单——用于从"XX（北京）YY"这种括号嵌入式公司名抽地区
+_KNOWN_REGIONS = {
+    "北京", "上海", "天津", "重庆",
+    "广州", "深圳", "杭州", "南京", "苏州", "成都", "武汉", "西安", "厦门", "青岛",
+    "大连", "宁波", "无锡", "长沙", "郑州", "济南", "沈阳", "哈尔滨", "长春",
+    "福州", "合肥", "南昌", "南宁", "昆明", "贵阳", "兰州", "西宁", "银川",
+    "乌鲁木齐", "拉萨", "呼和浩特", "石家庄", "太原", "海口", "三亚",
+    "佛山", "东莞", "中山", "珠海", "汕头", "温州", "绍兴", "嘉兴", "金华", "台州",
+    "广东", "江苏", "浙江", "山东", "河南", "河北", "山西", "陕西", "甘肃", "青海",
+    "四川", "云南", "贵州", "湖南", "湖北", "安徽", "福建", "江西", "辽宁", "吉林",
+    "黑龙江", "海南", "广西", "宁夏", "新疆", "西藏", "内蒙古", "香港", "澳门", "台湾",
+}
+
+
 def extract_region(full_name: str) -> tuple[str, str]:
     """
     从销方名称中拆出地区 + 公司名。
-    - 优先按 省/市/区/县/州 行政区后缀切分
-    - 否则取前 2 个字作为地区
+    优先级：
+      1) 公司名中嵌入的全/半角括号内地名命中白名单 —— 如 "万程（上海）旅行社有限公司" → 上海
+      2) 行政区后缀切分（XX市 / XX省 / XX自治区 / XX自治州）
+      3) 都不命中 → "未知地区"（不再退化到"取前 2 字"，避免"旅行"这类伪地区）
     """
     full_name = (full_name or "").strip()
     if not full_name:
         return "未知地区", ""
-    m = re.match(r"^(.+?[省市区县州])(.*)", full_name)
+    # 1) 括号内城市：（上海） / (北京) / （内蒙古）
+    m_paren = re.search(r"[（(]\s*([\u4e00-\u9fa5]{2,5})\s*[）)]", full_name)
+    if m_paren:
+        cand = m_paren.group(1).strip()
+        if cand in _KNOWN_REGIONS:
+            return cand, full_name
+    # 1.5) 名称裸前缀命中白名单（按长度从长到短匹配，优先 3 字如"内蒙古"/"哈尔滨"）
+    for length in (4, 3, 2):
+        prefix = full_name[:length]
+        if prefix in _KNOWN_REGIONS:
+            return prefix, full_name[length:]
+    # 2) 行政区后缀切分；命中后剥掉尾部行政区单字（市/省/州）以统一格式
+    #    "深圳市鲜语" → "深圳"；"南京市XX" → "南京"；自治区/自治州保留
+    m = re.match(r"^(.+?)(自治区|自治州|[省市州])(.*)", full_name)
     if m:
-        return m.group(1).strip(), m.group(2).strip()
-    if len(full_name) > 2:
-        return full_name[:2], full_name[2:]
+        head, suffix, rest = m.group(1).strip(), m.group(2), m.group(3).strip()
+        if suffix in ("自治区", "自治州"):
+            return (head + suffix), rest
+        # 单字行政区后缀（市/省/州）—— 剥掉，保留纯地名
+        if head:
+            return head, rest
     return "未知地区", full_name
 
 
@@ -294,6 +326,29 @@ def _looks_like_label_noise(value: str | None) -> bool:
     if not value:
         return True
     return bool(_NAME_NOISE_RE.search(value))
+
+
+def _clean_buyer_name(value: str | None) -> str | None:
+    """
+    清洗购方姓名候选：
+      - 剥掉尾部"（个人）"/"(个人)"（仅此一种已知尾缀，其他括号尾缀保留以兼容公司抬头）
+      - 单字直接判定为噪声（防止"购买方"被切单字后"买"误命中）
+      - 标签噪声词命中 → 拒绝
+    返回清洗后的合法姓名，或 None 表示拒绝。
+    """
+    if not value:
+        return None
+    cand = value.strip().rstrip("，,；;。.")
+    # 剥 "（个人）" / "(个人)" 尾缀
+    cand = re.sub(r"[（(]\s*个人\s*[）)]\s*$", "", cand).strip()
+    if not cand:
+        return None
+    # 单字拒绝
+    if len(cand) <= 1:
+        return None
+    if _looks_like_label_noise(cand):
+        return None
+    return cand
 
 
 def extract_invoice_fields(subject: str, html: str, text: str) -> dict:
@@ -717,16 +772,30 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                     if m:
                         invoice_no = m.group(1)
                 if not seller:
-                    # 优先匹配"XX市YY有限(责任)公司"
-                    m = re.search(r"([\u4e00-\u9fa5]+市[\u4e00-\u9fa5]+?有限(?:责任)?公司)", pdf_text_norm)
-                    if not m:
-                        m = re.search(r"([\u4e00-\u9fa5]{2,}?有限(?:责任)?公司)", pdf_text_norm)
-                    if m:
-                        seller = m.group(1)
+                    # 新版国标版式：seller 常包含括号城市，且公司种类不限于"有限公司"
+                    #  - 万程（上海）旅行社有限公司
+                    #  - XX市YY有限责任公司
+                    #  - XX旅行社 / XX酒店 / XX股份有限公司 / XX集团
+                    # 注意：优先吃到"有限(责任)公司/股份有限公司"完整后缀，避免在"旅行社"提前截断
+                    seller_patterns = [
+                        # 带括号城市的：万程（上海）xxx有限/股份/责任公司（贪婪到"公司"为止）
+                        r"([\u4e00-\u9fa5]{2,}?[（(][\u4e00-\u9fa5]{2,5}[）)][\u4e00-\u9fa5]{0,15}?(?:股份)?有限(?:责任)?公司)",
+                        # "XX市YY有限(责任)公司"
+                        r"([\u4e00-\u9fa5]+市[\u4e00-\u9fa5]+?有限(?:责任)?公司)",
+                        # 通用兜底：xxx(股份)有限(责任)公司
+                        r"([\u4e00-\u9fa5]{2,}?(?:股份)?有限(?:责任)?公司)",
+                        # 最弱兜底：带括号城市但无"公司"后缀（旅行社/酒店/集团）
+                        r"([\u4e00-\u9fa5]{2,}?[（(][\u4e00-\u9fa5]{2,5}[）)][\u4e00-\u9fa5]{0,10}?(?:集团|旅行社|酒店))",
+                    ]
+                    for pat in seller_patterns:
+                        m = re.search(pat, pdf_text_norm)
+                        if m:
+                            seller = m.group(1)
+                            break
                 if not name:
                     # 1) 标准 label（如"发票抬头"/"购买方名称"）
-                    cand = _search_label(pdf_text_norm, NAME_LABELS)
-                    if cand and not _looks_like_label_noise(cand):
+                    cand = _clean_buyer_name(_search_label(pdf_text_norm, NAME_LABELS))
+                    if cand:
                         name = cand
                 # 2) 切"购买方"到"销售方/销方"之间的区块，找区块内"名称:"（盒马等版式）
                 if not name:
@@ -737,33 +806,39 @@ def process_invoice_mail(msg, subject: str, sender: str) -> bool:
                     if m_blk:
                         m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", m_blk.group(0))
                         if m_n:
-                            cand = m_n.group(1).strip().rstrip("，,；;。.")
-                            if cand and not _looks_like_label_noise(cand):
+                            cand = _clean_buyer_name(m_n.group(1))
+                            if cand:
                                 name = cand
                 # 3) 全文第一个"名称:"作为最弱兜底（购方区块通常在销方之前）
                 if not name:
                     m_n = re.search(r"名\s*称\s*:\s*([^\s<>:]+)", pdf_text_norm)
                     if m_n:
-                        cand = m_n.group(1).strip().rstrip("，,；;。.")
-                        if cand and seller and cand != seller and not _looks_like_label_noise(cand):
+                        cand = _clean_buyer_name(m_n.group(1))
+                        if cand and (not seller or cand != seller):
                             name = cand
                 # 4) 名字 + 销方相邻的旧启发式（保留兼容）
                 if not name and seller:
                     m = re.search(
-                        r"([\u4e00-\u9fa5]{2,4})\s+" + re.escape(seller),
+                        r"([\u4e00-\u9fa5]{2,4}(?:[（(]\s*个人\s*[）)])?)\s+" + re.escape(seller),
                         pdf_text_norm,
                     )
-                    if m and not _looks_like_label_noise(m.group(1)):
-                        name = m.group(1)
+                    if m:
+                        cand = _clean_buyer_name(m.group(1))
+                        if cand:
+                            name = cand
                 # 5) 新版国家电子发票（购方/销方标签纵排成单字），值集中在文本末尾：
-                #    形如 "周琬 天津西瓜旅游有限责任公司" 的两 token 行
+                #    形如 "周琬 天津西瓜旅游有限责任公司" 或 "周典斌（个人） 万程（上海）旅行社有限公司"
                 if not name:
                     m = re.search(
-                        r"([\u4e00-\u9fa5]{2,6})\s+[\u4e00-\u9fa5]{2,}?有限(?:责任)?公司",
+                        r"([\u4e00-\u9fa5]{2,6}(?:[（(]\s*个人\s*[）)])?)\s+"
+                        r"[\u4e00-\u9fa5]{2,}?(?:[（(][\u4e00-\u9fa5]{2,5}[）)][\u4e00-\u9fa5]{0,10}?)?"
+                        r"(?:有限(?:责任)?公司|股份有限公司|集团|旅行社|酒店)",
                         pdf_text_norm,
                     )
-                    if m and not _looks_like_label_noise(m.group(1)):
-                        name = m.group(1).strip()
+                    if m:
+                        cand = _clean_buyer_name(m.group(1))
+                        if cand:
+                            name = cand
         finally:
             tmp_pdf.unlink(missing_ok=True)
 

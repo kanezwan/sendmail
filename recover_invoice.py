@@ -83,14 +83,15 @@ def select_mailbox(mail: imaplib.IMAP4_SSL, folder: str) -> int:
         return 0
 
 
-def search_since_today(mail: imaplib.IMAP4_SSL) -> list[bytes]:
+def search_since_today(mail: imaplib.IMAP4_SSL, since_date=None) -> list[bytes]:
     """
-    IMAP SEARCH SINCE <today> —— 按日（不含时分秒）粗筛。
-    本地再用 INTERNALDATE 精确二次过滤到 >= 今天 00:00:00。
+    IMAP SEARCH SINCE <date> —— 按日（不含时分秒）粗筛。
+    本地再用 INTERNALDATE 精确二次过滤到 >= 起点 00:00:00。
     """
-    today = datetime.now().date()
+    if since_date is None:
+        since_date = datetime.now().date()
     # IMAP SINCE 接受 DD-Mon-YYYY 形式
-    since_str = today.strftime("%d-%b-%Y")
+    since_str = since_date.strftime("%d-%b-%Y")
     status, data = mail.uid("search", None, "SINCE", since_str)
     if status != "OK" or not data or not data[0]:
         return []
@@ -133,11 +134,14 @@ def recover_from_account(
     account: dict,
     dry_run: bool = False,
     list_only: bool = False,
+    since_date=None,
 ) -> tuple[int, int, int]:
     """
-    在单个账号的「已删除」文件夹中回溯今天的发票邮件。
+    在单个账号的「已删除」文件夹中回溯指定日期起的发票邮件。
     返回 (匹配发票邮件数, 成功落盘数, 跳过数)
     """
+    if since_date is None:
+        since_date = datetime.now().date()
     mail = connect_imap(account["server"], account["user"], account["password"])
     if mail is None:
         return (0, 0, 0)
@@ -162,14 +166,14 @@ def recover_from_account(
             return (0, 0, 0)
         print(f"     共 {total} 封邮件")
 
-        uids = search_since_today(mail)
+        uids = search_since_today(mail, since_date=since_date)
         if not uids:
-            print(f"  📭 今天没有邮件")
+            print(f"  📭 起点日期之后没有邮件")
             return (0, 0, 0)
         print(f"  📬 IMAP SINCE 粗筛得到 {len(uids)} 封")
 
-        # 本地精确过滤：INTERNALDATE >= 今天 00:00
-        today_start = datetime.combine(datetime.now().date(), time.min)
+        # 本地精确过滤：INTERNALDATE >= 起点 00:00
+        today_start = datetime.combine(since_date, time.min)
 
         matched, ok_cnt, skip_cnt = 0, 0, 0
         for uid in uids:
@@ -229,9 +233,11 @@ def recover_from_account(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从已删除邮箱回溯今天的发票")
+    parser = argparse.ArgumentParser(description="从已删除邮箱回溯指定日期起的发票")
     parser.add_argument("--dry-run", action="store_true", help="只打印抽取结果，不下载、不落盘")
     parser.add_argument("--list-folders", action="store_true", help="列出每个账号的文件夹名（调试）")
+    parser.add_argument("--since", type=str, default=None,
+                        help="回溯起点日期 YYYY-MM-DD（含当日 00:00 起），默认今天")
     args = parser.parse_args()
 
     accounts = parse_accounts()
@@ -239,8 +245,16 @@ def main():
         print("❌ 未配置邮箱账号，请在 .env 文件中设置 EMAIL_ACCOUNTS")
         sys.exit(1)
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"🕒 回溯时间起点: {today_str} 00:00:00 (本地)")
+    if args.since:
+        try:
+            since_date = datetime.strptime(args.since, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"❌ --since 格式错误，应为 YYYY-MM-DD，收到: {args.since}")
+            sys.exit(1)
+    else:
+        since_date = datetime.now().date()
+
+    print(f"🕒 回溯时间起点: {since_date.strftime('%Y-%m-%d')} 00:00:00 (本地)")
     print(f"📁 输出目录: {BASE_DIR.resolve()}")
     print(f"🔧 模式: " + (
         "list-folders" if args.list_folders else ("dry-run（只读探查）" if args.dry_run else "实际恢复")
@@ -252,7 +266,8 @@ def main():
         if i > 0:
             print("\n" + "=" * 50 + "\n")
         m, ok, sk = recover_from_account(
-            account, dry_run=args.dry_run, list_only=args.list_folders
+            account, dry_run=args.dry_run, list_only=args.list_folders,
+            since_date=since_date,
         )
         grand_matched += m
         grand_ok += ok
