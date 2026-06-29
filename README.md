@@ -63,6 +63,10 @@ source ~/.venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **macOS 注意**：若安装 `pyobjc` 时报 `-Wdefault-const-init-var-unsafe` 编译错误，说明 Xcode/Clang 版本较新。
+> - 已升级到 `pyobjc>=10.3` 修复此问题
+> - 若仍有问题，可改用预编译 wheel：`pip install --only-binary :all: -r requirements.txt`
+
 ## 配置 `.env`
 
 ```env

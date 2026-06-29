@@ -13,6 +13,7 @@
    c. 正文中"查看发票"类链接 → 进入中转页 → 在 HTML/JS 里搜 .pdf 链接或下载 API
 3. 拿到 PDF → 转 JPG → 保存至 invoice/{姓名}-{地区}/{发票号}.jpg
 """
+from __future__ import annotations
 
 import imaplib
 import email
